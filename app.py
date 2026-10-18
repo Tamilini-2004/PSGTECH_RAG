@@ -1066,7 +1066,8 @@ def generate_answer(
             except Exception as exc:
                 status_code = http_status_code(exc)
                 can_try_next_key = (
-                    status_code in {401, 403} and key_number < len(api_keys)
+                    status_code in {401, 403, 429}
+                    and key_number < len(api_keys)
                 )
                 if not can_try_next_key:
                     raise
