@@ -1435,9 +1435,9 @@ if "messages" not in st.session_state:
 
 st.markdown("**Try a question**")
 suggestions = (
-    "What programmes does PSG Tech offer?",
-    "Which departments are listed?",
-    "Where can I find admissions information?",
+    "Which undergraduate, postgraduate, integrated and research programmes are offered?",
+    "Which academic departments are listed at PSG Tech?",
+    "What admissions information is available for 2026 programmes?",
 )
 suggestion_columns = st.columns(len(suggestions))
 for suggestion_number, (column, suggestion) in enumerate(
