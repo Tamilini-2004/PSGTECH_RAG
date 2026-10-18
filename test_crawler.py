@@ -90,6 +90,14 @@ HOME_HTML = """<!doctype html>
 <a href="/files/guide.pdf">PDF</a></main><footer>FOOTER NOISE</footer></body></html>"""
 
 
+def missing_sitemap_responses(host: str) -> dict[str, FakeResponse]:
+    """Mock conventional sitemap checks after a successful homepage fetch."""
+    return {
+        f"https://{host}{path}": FakeResponse(status_code=404)
+        for path in ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml")
+    }
+
+
 def test_internal_url_is_accepted_and_www_alias_is_canonicalized():
     assert normalize_url("https://www.psgtech.edu/about") == "https://psgtech.edu/about"
     assert normalize_url("http://psgtech.edu/about") == "https://psgtech.edu/about"
@@ -241,6 +249,7 @@ def test_redirect_to_approved_www_alias_checks_its_robots_and_deduplicates(tmp_p
                 "<body><main>Public information from PSG College of Technology "
                 "for students, faculty, and the community.</main></body></html>"
             ),
+            **missing_sitemap_responses("www.psgtech.edu"),
         }
     )
     database_path = tmp_path / "knowledge.db"
@@ -262,6 +271,9 @@ def test_redirect_to_approved_www_alias_checks_its_robots_and_deduplicates(tmp_p
         "https://psgtech.edu/",
         "https://www.psgtech.edu/robots.txt",
         "https://www.psgtech.edu/",
+        "https://www.psgtech.edu/sitemap.xml",
+        "https://www.psgtech.edu/sitemap_index.xml",
+        "https://www.psgtech.edu/wp-sitemap.xml",
     ]
 
 
@@ -286,6 +298,7 @@ def test_robots_http_404_uses_allow_all_policy_and_fetches_seed_page(tmp_path: P
         {
             "https://psgtech.edu/robots.txt": FakeResponse(status_code=404),
             "https://psgtech.edu/": FakeResponse(HOME_HTML),
+            **missing_sitemap_responses("psgtech.edu"),
         }
     )
     crawler = Crawler(
@@ -301,6 +314,9 @@ def test_robots_http_404_uses_allow_all_policy_and_fetches_seed_page(tmp_path: P
     assert session.requested == [
         "https://psgtech.edu/robots.txt",
         "https://psgtech.edu/",
+        "https://psgtech.edu/sitemap.xml",
+        "https://psgtech.edu/sitemap_index.xml",
+        "https://psgtech.edu/wp-sitemap.xml",
     ]
 
 
@@ -461,6 +477,7 @@ def test_crawl_discovers_internal_pages_and_rerun_updates_database(tmp_path: Pat
                 ),
                 "https://psgtech.edu/": FakeResponse(home),
                 "https://psgtech.edu/about": FakeResponse(about),
+                **missing_sitemap_responses("psgtech.edu"),
             }
         )
 

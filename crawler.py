@@ -9,13 +9,17 @@ create/update the local SQLite knowledge base.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import io
 import posixpath
 import re
 import sqlite3
 import ssl
 import time
 import urllib.robotparser
+import zlib
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,12 +36,39 @@ from urllib.parse import (
 
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from requests.adapters import HTTPAdapter
 
 
 START_URL = "https://psgtech.edu/"
 ALLOWED_HOSTS = frozenset({"psgtech.edu", "www.psgtech.edu"})
 CANONICAL_HOST = "psgtech.edu"
+FOCUS_SEED_CANDIDATES = (
+    ("Programme and degree catalogue", "https://psgtech.edu/programme.php"),
+    ("Programmes offered", "https://psgtech.edu/programme_offered.php"),
+    ("Department index", "https://psgtech.edu/index.php"),
+    ("Department heads", "https://psgtech.edu/Heads.php"),
+    ("Faculty directory", "https://psgtech.edu/facultyDetails.php"),
+    ("Admissions information", "https://psgtech.edu/admission.php"),
+    ("2026 postgraduate admissions", "https://psgtech.edu/pgadmission2026/"),
+    ("2026 integrated programme admissions", "https://psgtech.edu/BScMScAdmission2026/"),
+    ("Research directory", "https://psgtech.edu/Grd/Research.php"),
+    ("Research and development", "https://psgtech.edu/Research/ird.html"),
+    ("Research centres", "https://psgtech.edu/Research/coe.html"),
+    ("Placement statistics", "https://psgtech.edu/placements/Statistics.php"),
+    ("Placement and training", "https://psgtech.edu/placements/index.php"),
+    ("Placement recruiters", "https://psgtech.edu/placements/recrs.php"),
+    ("Placement programmes", "https://psgtech.edu/placements/programmes.php"),
+    ("Hostel home", "https://psgtech.edu/hostel/"),
+    ("Hostel rules", "https://psgtech.edu/hostel/general.php"),
+    ("Hostel discipline rules", "https://psgtech.edu/hostel/discipline.php"),
+    ("Hostel mess information", "https://psgtech.edu/hostel/mess.php"),
+    ("Student coding club", "https://psgtech.edu/placements/codingclub.php"),
+    ("Official PSG Tech website directory", "https://psgtech.edu/websiteUrls.php"),
+)
+SITEMAP_FALLBACK_PATHS = ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml")
+MAX_SITEMAP_DOCUMENTS = 25
+MAX_SITEMAP_LOCATIONS = 50_000
 USER_AGENT = "PSGTech-Academic-Crawler/1.0 (educational research)"
 DEFAULT_DATABASE = Path(__file__).with_name("psgtech_knowledge_base.db")
 TRACKING_PARAMETERS = frozenset(
@@ -161,6 +192,12 @@ class CrawlConfig:
     request_timeout: float = 10.0
     min_request_interval: float = 1.0
     max_response_bytes: int = 2_000_000
+    max_pdf_bytes: int = 20_000_000
+    max_pdf_pages: int = 500
+    max_pdf_text_chars: int = 10_000_000
+    max_sitemap_bytes: int = 10_000_000
+    include_pdfs: bool = False
+    include_focus_seeds: bool = False
     user_agent: str = USER_AGENT
     max_redirects: int = 5
 
@@ -173,6 +210,14 @@ class CrawlConfig:
             raise ValueError("min_request_interval must be at least 1 second")
         if self.max_response_bytes < 1:
             raise ValueError("max_response_bytes must be at least 1 byte")
+        if self.max_pdf_bytes < 1:
+            raise ValueError("max_pdf_bytes must be at least 1 byte")
+        if self.max_pdf_pages < 1:
+            raise ValueError("max_pdf_pages must be at least 1")
+        if self.max_pdf_text_chars < 1:
+            raise ValueError("max_pdf_text_chars must be at least 1 character")
+        if self.max_sitemap_bytes < 1:
+            raise ValueError("max_sitemap_bytes must be at least 1 byte")
         if self.max_redirects < 0:
             raise ValueError("max_redirects cannot be negative")
         if not self.user_agent.strip():
@@ -185,6 +230,7 @@ class CrawlStats:
 
     urls_visited: int = 0
     html_pages_fetched: int = 0
+    pdf_documents_fetched: int = 0
     pages_stored_or_updated: int = 0
     skipped_assets_or_non_html: int = 0
     robots_disallowed: int = 0
@@ -257,6 +303,16 @@ def is_asset_url(url: str) -> bool:
         return Path(path).suffix in ASSET_EXTENSIONS
     except ValueError:
         return True
+
+
+def is_pdf_url(url: str) -> bool:
+    """Recognize PDF paths and download endpoints with a PDF-valued query."""
+    try:
+        parsed = urlsplit(url)
+        candidates = [parsed.path, *(value for _key, value in parse_qsl(parsed.query))]
+        return any(unquote(value).strip().casefold().endswith(".pdf") for value in candidates)
+    except ValueError:
+        return False
 
 
 def is_restricted_url(url: str) -> bool:
@@ -529,6 +585,17 @@ class Crawler:
         self.visited: set[str] = set()
         self.queued: set[str] = set()
         self.considered: set[str] = set()
+        configured_start = normalize_url(self.config.start_url)
+        if configured_start == normalize_url(START_URL):
+            seed_urls = [configured_start]
+            if self.config.include_focus_seeds:
+                seed_urls.extend(
+                    normalize_url(url) for _, url in FOCUS_SEED_CANDIDATES
+                )
+            self.initial_seeds = tuple(dict.fromkeys(seed for seed in seed_urls if seed))
+        else:
+            self.initial_seeds = (configured_start,) if configured_start else ()
+        self._sitemap_discovery_done = False
         self.database: KnowledgeBase | None = None
 
     def close(self) -> None:
@@ -548,7 +615,10 @@ class Crawler:
         if normalized in self.considered:
             return None
         self.considered.add(normalized)
-        if is_asset_url(normalized):
+        is_pdf = is_pdf_url(normalized)
+        if (is_asset_url(normalized) or is_pdf) and not (
+            self.config.include_pdfs and is_pdf
+        ):
             self.stats.skipped_assets_or_non_html += 1
             return None
         if not self.robots.allowed(normalized):
@@ -557,11 +627,14 @@ class Crawler:
             return None
         return normalized
 
-    def _read_limited_response(self, response: Any) -> bytes:
+    def _read_limited_response(
+        self, response: Any, *, max_bytes: int | None = None
+    ) -> bytes:
+        limit = self.config.max_response_bytes if max_bytes is None else max_bytes
         content_length = response.headers.get("Content-Length")
         if content_length:
             try:
-                if int(content_length) > self.config.max_response_bytes:
+                if int(content_length) > limit:
                     raise ResponseTooLargeError("Response exceeds configured size limit")
             except ValueError:
                 pass
@@ -572,7 +645,7 @@ class Crawler:
             if not chunk:
                 continue
             total += len(chunk)
-            if total > self.config.max_response_bytes:
+            if total > limit:
                 raise ResponseTooLargeError("Response exceeds configured size limit")
             chunks.append(chunk)
         return b"".join(chunks)
@@ -654,6 +727,141 @@ class Crawler:
                 if not request_already_paced:
                     self.robots.pace_after_page_request(host)
 
+    def _fetch_pdf(self, start_url: str) -> tuple[str, bytes] | None:
+        """Fetch an explicitly enabled PDF after robots, host, and size checks."""
+        current = start_url
+        chain: set[str] = set()
+        redirects = 0
+        while True:
+            if current in chain:
+                raise CrawlError(f"PDF redirect loop detected at {current}")
+            chain.add(current)
+            host = urlsplit(current).hostname or ""
+            if not self.robots.allowed(current):
+                self.stats.robots_disallowed += 1
+                self._log(f"[robots] Disallowed PDF: {current}")
+                return None
+
+            response: Any = None
+            request_already_paced = False
+            try:
+                response = self.session.get(
+                    current,
+                    headers={
+                        "User-Agent": self.config.user_agent,
+                        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+                    },
+                    timeout=min(10.0, self.config.request_timeout),
+                    verify=True,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                if response.status_code in REDIRECT_STATUSES:
+                    if redirects >= self.config.max_redirects:
+                        raise CrawlError(f"Too many PDF redirects from {start_url}")
+                    location = response.headers.get("Location")
+                    target = normalize_url(
+                        location or "", base_url=current, canonicalize_host=False
+                    )
+                    if (
+                        target is None
+                        or is_restricted_url(target)
+                        or (is_asset_url(target) and not is_pdf_url(target))
+                    ):
+                        raise UnsafeRedirectError(
+                            f"Rejected PDF redirect outside the approved document scope: {location}"
+                        )
+                    response.close()
+                    response = None
+                    self.robots.pace_after_page_request(host)
+                    request_already_paced = True
+                    if not self.robots.allowed(target):
+                        self.stats.robots_disallowed += 1
+                        self._log(f"[robots] PDF redirect target disallowed: {target}")
+                        return None
+                    redirects += 1
+                    current = target
+                    continue
+                if response.status_code in {401, 403, 429}:
+                    raise AccessRestrictionError(
+                        f"HTTP {response.status_code} for PDF {current}; stopping without retrying"
+                    )
+                if response.status_code != 200:
+                    raise CrawlError(f"PDF request returned HTTP {response.status_code} for {current}")
+                media_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if media_type not in {"application/pdf", "application/octet-stream"}:
+                    self.stats.skipped_assets_or_non_html += 1
+                    self._log(
+                        f"[skip] PDF URL returned non-PDF content ({media_type or 'unknown'}): {current}"
+                    )
+                    return None
+                body = self._read_limited_response(
+                    response, max_bytes=self.config.max_pdf_bytes
+                )
+                if b"%PDF-" not in body[:1024]:
+                    raise CrawlError(f"The response at {current} is not a valid PDF file")
+                self.stats.pdf_documents_fetched += 1
+                return current, body
+            finally:
+                if response is not None:
+                    response.close()
+                if not request_already_paced:
+                    self.robots.pace_after_page_request(host)
+
+    def _extract_pdf(self, body: bytes, source_url: str) -> tuple[str, str]:
+        """Extract bounded text from a readable PDF without changing the schema."""
+        try:
+            reader = PdfReader(io.BytesIO(body), strict=False)
+            if reader.is_encrypted:
+                raise CrawlError(f"The PDF is encrypted: {source_url}")
+            page_count = len(reader.pages)
+            if page_count < 1:
+                raise CrawlError(f"The PDF contains no pages: {source_url}")
+            if page_count > self.config.max_pdf_pages:
+                raise CrawlError(
+                    f"The PDF has {page_count} pages, above the configured limit "
+                    f"of {self.config.max_pdf_pages}: {source_url}"
+                )
+            extracted_pages: list[str] = []
+            total_chars = 0
+            for page_number, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = clean_text(page.extract_text() or "")
+                except Exception as exc:
+                    raise CrawlError(
+                        f"Text extraction failed on PDF page {page_number} at {source_url}: {exc}"
+                    ) from exc
+                if page_text:
+                    total_chars += len(page_text)
+                    if total_chars > self.config.max_pdf_text_chars:
+                        raise CrawlError(
+                            f"Extracted PDF text exceeds the configured character limit: {source_url}"
+                        )
+                    extracted_pages.append(page_text)
+        except CrawlError:
+            raise
+        except Exception as exc:
+            raise CrawlError(
+                f"Could not parse PDF at {source_url} ({type(exc).__name__}): {exc}"
+            ) from exc
+
+        content = clean_text("\n".join(extracted_pages))
+        if not is_usable_content(content):
+            raise CrawlError(
+                f"No selectable text was found in PDF {source_url}; scanned files need OCR"
+            )
+        try:
+            metadata_title = (
+                clean_text(str(reader.metadata.title or ""))
+                if reader.metadata
+                else ""
+            )
+        except Exception:
+            metadata_title = ""
+        filename = posixpath.splitext(posixpath.basename(unquote(urlsplit(source_url).path)))[0]
+        fallback_title = clean_text(filename.replace("_", " ").replace("-", " "))
+        return metadata_title or fallback_title or "PSG Tech PDF document", content
+
     def _discover_links(self, html: bytes, page_url: str, queue: list[str]) -> None:
         soup = BeautifulSoup(html, "html.parser")
         for anchor in soup.find_all("a", href=True):
@@ -664,6 +872,202 @@ class Crawler:
             if eligible is not None:
                 queue.append(eligible)
                 self.queued.add(eligible)
+
+    @staticmethod
+    def _sitemap_loc_values(document: bytes) -> tuple[bool, list[str]]:
+        """Parse a sitemap or sitemap index without resolving external entities."""
+        lowered = document.lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            raise ET.ParseError(
+                "DTD and entity declarations are not accepted in sitemaps"
+            )
+        root = ET.fromstring(document)
+        if not isinstance(root.tag, str):
+            raise ET.ParseError("Sitemap XML has no valid document element")
+        root_name = root.tag.rsplit("}", 1)[-1].casefold()
+        locations = [
+            (element.text or "").strip()
+            for element in root.iter()
+            if isinstance(element.tag, str)
+            and element.tag.rsplit("}", 1)[-1].casefold() == "loc"
+            and (element.text or "").strip()
+        ]
+        return root_name == "sitemapindex", locations
+
+    def _read_sitemap_response(self, response: Any) -> bytes:
+        """Read a bounded sitemap body, including a directly gzipped sitemap."""
+        raw = self._read_limited_response(
+            response, max_bytes=self.config.max_sitemap_bytes
+        )
+        if raw.startswith(b"\x1f\x8b"):
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                document = compressed.read(self.config.max_sitemap_bytes + 1)
+            if len(document) > self.config.max_sitemap_bytes:
+                raise ResponseTooLargeError(
+                    "Decompressed sitemap exceeds configured size limit"
+                )
+            return document
+        return raw
+
+    def _fetch_sitemap(self, sitemap_url: str) -> bytes | None:
+        """Fetch a same-site sitemap with robots checks and manually vetted redirects."""
+        current = sitemap_url
+        visited_redirects: set[str] = set()
+        redirects = 0
+        while True:
+            if current in visited_redirects:
+                self._log(f"[sitemap] Redirect loop rejected: {current}")
+                self.stats.request_or_database_errors += 1
+                return None
+            visited_redirects.add(current)
+            host = urlsplit(current).hostname or ""
+            if not is_approved_host(host):
+                self._log(f"[sitemap] Unapproved sitemap host rejected: {current}")
+                return None
+            if not self.robots.allowed(current):
+                self.stats.robots_disallowed += 1
+                self._log(f"[robots] Sitemap disallowed: {current}")
+                return None
+
+            response: Any = None
+            request_already_paced = False
+            try:
+                response = self.session.get(
+                    current,
+                    headers={
+                        "User-Agent": self.config.user_agent,
+                        "Accept": "application/xml,text/xml,application/gzip,*/*;q=0.5",
+                    },
+                    timeout=min(10.0, self.config.request_timeout),
+                    verify=True,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                if response.status_code in REDIRECT_STATUSES:
+                    if redirects >= self.config.max_redirects:
+                        raise CrawlError(f"Too many sitemap redirects from {sitemap_url}")
+                    location = response.headers.get("Location")
+                    target = normalize_url(
+                        location or "", base_url=current, canonicalize_host=False
+                    )
+                    if target is None:
+                        raise UnsafeRedirectError(
+                            f"Sitemap redirect outside approved hosts from {current}"
+                        )
+                    response.close()
+                    response = None
+                    self.robots.pace_after_page_request(host)
+                    request_already_paced = True
+                    redirects += 1
+                    current = target
+                    continue
+                if response.status_code == 404:
+                    self._log(f"[sitemap] Not found: {current}")
+                    return None
+                if response.status_code != 200:
+                    raise CrawlError(
+                        f"Sitemap request for {current} returned HTTP {response.status_code}"
+                    )
+                return self._read_sitemap_response(response)
+            except (
+                requests.RequestException,
+                CrawlError,
+                OSError,
+                EOFError,
+                zlib.error,
+            ) as exc:
+                self.stats.request_or_database_errors += 1
+                self._log(f"[sitemap] Could not safely retrieve {current}: {exc}")
+                return None
+            finally:
+                if response is not None:
+                    response.close()
+                if not request_already_paced:
+                    self.robots.pace_after_page_request(host)
+
+    def _discover_sitemap_urls(self, queue: list[str], homepage_url: str) -> None:
+        """Inject bounded, robots-allowed internal URLs from the site's sitemap."""
+        if self._sitemap_discovery_done:
+            return
+        self._sitemap_discovery_done = True
+
+        hostname = urlsplit(homepage_url).hostname or ""
+        parser = self.robots.parsers.get(hostname)
+        advertised = parser.site_maps() if parser is not None else None
+        candidates: list[str] = []
+        for advertised_url in advertised or []:
+            sitemap_url = normalize_url(
+                advertised_url, canonicalize_host=False
+            )
+            if sitemap_url is not None and sitemap_url not in candidates:
+                candidates.append(sitemap_url)
+        fallback_candidates = [
+            f"https://{hostname}{path}" for path in SITEMAP_FALLBACK_PATHS
+        ]
+        sitemap_queue = list(candidates or fallback_candidates)
+        try_fallbacks = bool(candidates)
+        usable_sitemap_found = False
+        sitemap_seen: set[str] = set()
+        locations_seen = 0
+        while len(sitemap_seen) < MAX_SITEMAP_DOCUMENTS:
+            if not sitemap_queue:
+                if try_fallbacks and not usable_sitemap_found:
+                    # An advertised sitemap was absent or invalid. Try the
+                    # standard paths on the already verified homepage origin.
+                    sitemap_queue = [
+                        url for url in fallback_candidates if url not in sitemap_seen
+                    ]
+                    try_fallbacks = False
+                    continue
+                break
+            sitemap_url = sitemap_queue.pop(0)
+            if sitemap_url in sitemap_seen:
+                continue
+            sitemap_seen.add(sitemap_url)
+            document = self._fetch_sitemap(sitemap_url)
+            if document is None:
+                continue
+            try:
+                is_index, locations = self._sitemap_loc_values(document)
+            except ET.ParseError as exc:
+                self.stats.request_or_database_errors += 1
+                self._log(f"[sitemap] Invalid XML at {sitemap_url}: {exc}")
+                continue
+            usable_sitemap_found = True
+
+            if is_index:
+                for location in locations:
+                    nested = normalize_url(location, canonicalize_host=False)
+                    if (
+                        nested is not None
+                        and nested not in sitemap_seen
+                        and nested not in sitemap_queue
+                    ):
+                        sitemap_queue.append(nested)
+                continue
+
+            for location in locations:
+                locations_seen += 1
+                if locations_seen > MAX_SITEMAP_LOCATIONS:
+                    self._log(
+                        f"[sitemap] Stopped after {MAX_SITEMAP_LOCATIONS} locations."
+                    )
+                    return
+                candidate = normalize_url(location)
+                if (
+                    candidate is None
+                    or candidate in self.visited
+                    or candidate in self.queued
+                ):
+                    continue
+                eligible = self._eligible(candidate)
+                if eligible is not None:
+                    queue.append(eligible)
+                    self.queued.add(eligible)
+            self._log(
+                f"[sitemap] Discovered URLs from {sitemap_url}; "
+                f"{len(queue)} URL(s) are queued."
+            )
 
     def _verify_homepage(self, url: str, title: str | None, content: str) -> None:
         """Confirm the seed response belongs to the requested official site."""
@@ -699,8 +1103,9 @@ class Crawler:
                 self._log(f"[database error] {self.config.database_path}: {exc}")
                 return self.stats
 
-            queue = [start]
-            self.queued.add(start)
+            queue = list(self.initial_seeds or (start,))
+            for seed in queue:
+                self.queued.add(seed)
             head = 0
             while head < len(queue) and self.stats.urls_visited < self.config.page_limit:
                 requested_url = queue[head]
@@ -714,15 +1119,25 @@ class Crawler:
                     f"[visit {self.stats.urls_visited}/{self.config.page_limit}] {requested_url}"
                 )
                 try:
-                    fetched = self._fetch_html(requested_url)
-                    if fetched is None:
-                        continue
-                    final_url, html = fetched
+                    is_pdf = self.config.include_pdfs and is_pdf_url(requested_url)
+                    if is_pdf:
+                        fetched_pdf = self._fetch_pdf(requested_url)
+                        if fetched_pdf is None:
+                            continue
+                        final_url, pdf_body = fetched_pdf
+                        title, content = self._extract_pdf(pdf_body, final_url)
+                        html: bytes | None = None
+                    else:
+                        fetched_html = self._fetch_html(requested_url)
+                        if fetched_html is None:
+                            continue
+                        final_url, html = fetched_html
+                        title, content = extract_page(html)
+                        if requested_url == start:
+                            self._verify_homepage(final_url, title, content)
+
                     canonical_final_url = normalize_url(final_url) or final_url
                     self.visited.add(canonical_final_url)
-                    title, content = extract_page(html)
-                    if requested_url == start:
-                        self._verify_homepage(final_url, title, content)
 
                     if is_usable_content(content):
                         assert self.database is not None
@@ -735,7 +1150,10 @@ class Crawler:
                         self._log(
                             f"[skip] Empty or near-empty page: {canonical_final_url}"
                         )
-                    self._discover_links(html, final_url, queue)
+                    if html is not None:
+                        self._discover_links(html, final_url, queue)
+                        if requested_url == start:
+                            self._discover_sitemap_urls(queue, final_url)
                 except RobotsPolicyError:
                     # Never continue if a newly discovered hostname's policy
                     # cannot be verified.
@@ -769,13 +1187,29 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--page-limit", type=int, default=100)
     parser.add_argument("--max-response-bytes", type=int, default=2_000_000)
+    parser.add_argument("--max-pdf-bytes", type=int, default=20_000_000)
+    parser.add_argument("--max-pdf-pages", type=int, default=500)
     parser.add_argument("--request-delay", type=float, default=1.0)
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    parser.add_argument(
+        "--include-pdfs",
+        action="store_true",
+        help="Fetch robots-allowed PDFs from approved hosts and extract their text",
+    )
+    parser.add_argument(
+        "--focus-seeds",
+        action="store_true",
+        help="Prioritize verified programme, faculty, placement, hostel, and directory pages",
+    )
     args = parser.parse_args(argv)
     crawler = Crawler(
         CrawlConfig(
             page_limit=args.page_limit,
             max_response_bytes=args.max_response_bytes,
+            max_pdf_bytes=args.max_pdf_bytes,
+            max_pdf_pages=args.max_pdf_pages,
+            include_pdfs=args.include_pdfs,
+            include_focus_seeds=args.focus_seeds,
             min_request_interval=args.request_delay,
             database_path=args.database,
         )
@@ -793,6 +1227,7 @@ def main(argv: list[str] | None = None) -> None:
         print("\nCrawl summary")
         print(f"  URLs visited:                    {stats.urls_visited}")
         print(f"  HTML pages successfully fetched: {stats.html_pages_fetched}")
+        print(f"  PDF documents successfully fetched: {stats.pdf_documents_fetched}")
         print(f"  Pages stored or updated:         {stats.pages_stored_or_updated}")
         print(f"  Assets/non-HTML skipped:          {stats.skipped_assets_or_non_html}")
         print(f"  Robots-disallowed URLs:           {stats.robots_disallowed}")
