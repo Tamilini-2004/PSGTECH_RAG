@@ -343,8 +343,9 @@ use Git LFS.
    Keep `.env`, `.streamlit/secrets.toml`, and local editor settings out of the
    repository. The `.gitignore` excludes local credentials and `.vscode`.
 2. Open [Streamlit Community Cloud](https://share.streamlit.io/), connect
-   GitHub, and create an app from the repository. Select branch `main` and
-   entrypoint `app.py`.
+   GitHub, and create or update the app from the repository. Select branch
+   `deploy/streamlit-cloud` and entrypoint `app.py`. The hosted app must use
+   this branch to receive the plural Gemini key support in the current code.
 3. In the deployment dialog's **Advanced settings**, select a Python version
    compatible with `requirements.txt` and add the secret below. Use the valid
    Google AI Studio Developer API key privately in the settings; do not paste

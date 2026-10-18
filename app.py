@@ -196,29 +196,39 @@ def _normalize_api_keys(value: object) -> tuple[str, ...]:
 
 
 def gemini_api_keys() -> tuple[str, ...]:
-    """Read a server-side key pool, retaining support for the singular setting."""
-    environment_pool = _normalize_api_keys(os.environ.get("GEMINI_API_KEYS", ""))
-    if environment_pool:
-        return environment_pool
+    """Read key pools, numbered alternatives, or the legacy singular setting."""
+    configured: list[str] = []
 
-    # Streamlit Community Cloud secrets are separate from process environment.
-    # A local run without secrets.toml is expected and falls through cleanly.
+    # The pool form supports comma/newline-delimited .env values and TOML arrays
+    # in Streamlit secrets. Local environment values are considered first.
+    configured.extend(
+        _normalize_api_keys(os.environ.get("GEMINI_API_KEYS", ""))
+    )
     try:
-        secrets_pool = _normalize_api_keys(st.secrets.get("GEMINI_API_KEYS", []))
+        configured.extend(_normalize_api_keys(st.secrets.get("GEMINI_API_KEYS", [])))
     except Exception:
-        secrets_pool = ()
-    if secrets_pool:
-        return secrets_pool
+        # st.secrets is unavailable for a normal local run without secrets.toml.
+        pass
 
-    single_environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if single_environment_key:
-        return (single_environment_key,)
+    # Also accept individually named alternatives, a common way to configure
+    # multiple secrets in hosting dashboards.
+    for number in range(1, 11):
+        variable_name = f"GEMINI_API_KEY_{number}"
+        configured.extend(_normalize_api_keys(os.environ.get(variable_name, "")))
+        try:
+            configured.extend(
+                _normalize_api_keys(st.secrets.get(variable_name, ""))
+            )
+        except Exception:
+            pass
 
+    configured.extend(_normalize_api_keys(os.environ.get("GEMINI_API_KEY", "")))
     try:
-        single_secret_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        configured.extend(_normalize_api_keys(st.secrets.get("GEMINI_API_KEY", "")))
     except Exception:
-        single_secret_key = ""
-    return (single_secret_key,) if single_secret_key else ()
+        pass
+
+    return tuple(dict.fromkeys(configured))
 
 
 def local_placeholder_proxy() -> str:
@@ -571,21 +581,47 @@ def retrieve_context(
             add_database_record(department_url)
 
     if PROGRAMME_INTENT.search(lowered_question):
+        # Prefer the college's academic programme catalogues. A broad
+        # substring match also captures placement services and unrelated
+        # programme pages (for example, community radio schedules).
+        academic_catalogue_paths = {
+            "/programme.php",
+            "/programme_offered.php",
+        }
         programme_urls = [
             url
-            for url, (title, _body) in database_items
-            if "programme" in url.casefold() or "programme" in title.casefold()
-        ][:2]
+            for url, _record in database_items
+            if urlsplit(url).path.casefold() in academic_catalogue_paths
+        ]
         for programme_url in programme_urls:
             add_database_record(programme_url)
 
     if ADMISSION_INTENT.search(lowered_question):
+        # Keep the current official admissions hubs ahead of secondary pages,
+        # and skip index.html aliases for the same directory-level resource.
+        admission_priority = {
+            "/pgadmission2026/": 0,
+            "/bscmscadmission2026/": 1,
+            "/admission.php": 2,
+        }
         admission_urls = [
             url
             for url, (title, _body) in database_items
-            if "admission" in url.casefold() or "admission" in title.casefold()
+            if (
+                urlsplit(url).path.casefold() in admission_priority
+                or (
+                    "admission" in title.casefold()
+                    and ".pdf" not in urlsplit(url).path.casefold()
+                    and "index.html" not in urlsplit(url).path.casefold()
+                )
+            )
         ]
-        admission_urls.sort(key=lambda url: ("2026" not in url, url))
+        admission_urls.sort(
+            key=lambda url: (
+                admission_priority.get(urlsplit(url).path.casefold(), 3),
+                url,
+            )
+        )
         for admission_url in admission_urls[:2]:
             add_database_record(admission_url)
 
@@ -1369,12 +1405,17 @@ st.sidebar.markdown("### PSG Tech Advisor")
 st.sidebar.caption("Grounded answers from the indexed public website")
 st.sidebar.header("PSG Tech grounded assistant")
 st.sidebar.caption(f"{GEMINI_MODEL} | Google Gemini API")
-if gemini_api_keys():
-    st.sidebar.success("Gemini server-side key(s) loaded; values are hidden.")
+configured_gemini_keys = gemini_api_keys()
+if configured_gemini_keys:
+    st.sidebar.success(
+        f"{len(configured_gemini_keys)} Gemini key(s) loaded; values are hidden."
+    )
 else:
     st.sidebar.warning(
-        "GEMINI_API_KEY or GEMINI_API_KEYS is not configured. Add it to the "
-        "project .env, server environment, or Streamlit secrets to generate answers."
+        "No Gemini key was found by this app runtime. In Streamlit hosting, add "
+        "GEMINI_API_KEYS as a TOML list or GEMINI_API_KEY_1, GEMINI_API_KEY_2, "
+        "and so on under App settings → Secrets, then reboot the app. A local "
+        ".env file is not automatically uploaded to the hosted app."
     )
 if CLEARED_PLACEHOLDER_PROXY_NAMES:
     st.sidebar.info(
