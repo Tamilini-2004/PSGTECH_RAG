@@ -44,10 +44,13 @@ records, rebuild the Chroma index before asking the app about the new content.
    writes model-sized text windows and source metadata into the persistent
    `psgtech_chroma_db` Chroma collection. It uses
    `sentence-transformers/all-MiniLM-L6-v2` on CPU; the first index build may
-   download the model.
+   download the model. Later runs synchronize stable window IDs, embedding only
+   new or changed text and removing windows no longer present in SQLite.
 4. **Run chat:** `app.py` loads the existing SQLite records and Chroma index,
-   retrieves up to 14 relevant passages (at most two semantic passages per
-   source URL), and sends those records to Gemini with grounding instructions.
+   ranks passages by embedding similarity (at most two per source URL), and may
+   add up to four verified intent-specific records as supporting evidence. It
+   sends those records to Gemini with instructions to interpret the requested
+   meaning and relationships, not rely on exact wording alone.
    Gemini streams a structured JSON answer. The interface displays one
    retrieved, validated source URL and keeps a downloadable session transcript.
 
@@ -291,7 +294,8 @@ Install the project dependencies in PowerShell:
 Build the persistent Chroma index from the existing SQLite database. The first
 build downloads the all-MiniLM-L6-v2 embedding model; it then runs on CPU, so no
 GPU is needed. Chroma stores model-sized overlapping search windows and maps
-each match back to the full source page in SQLite.
+each match back to the full source page in SQLite. Subsequent runs reuse
+unchanged windows and embed only additions or changed text.
 
 ~~~
 .\.venv\Scripts\python.exe .\rag_engine.py

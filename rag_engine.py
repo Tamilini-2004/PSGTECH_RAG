@@ -147,9 +147,9 @@ def iter_documents(
 def build_index(
     database_path: Path,
     output_dir: Path,
-    batch_size: int = 32,
+    batch_size: int = 128,
 ) -> tuple[int, int]:
-    """Build or replace the persistent Chroma collection with CPU embeddings."""
+    """Synchronize the persistent Chroma collection with CPU embeddings."""
     if batch_size < 1:
         raise IndexBuildError("Batch size must be a positive integer.")
 
@@ -179,34 +179,41 @@ def build_index(
         ) from exc
 
     try:
-        old_ids = vector_store.get(include=["metadatas"]).get("ids", [])
-        for start in range(0, len(old_ids), batch_size):
-            vector_store.delete(ids=old_ids[start : start + batch_size])
-        if old_ids:
-            print(f"[clear] Removed {len(old_ids)} previous Chroma documents.")
-
+        existing_ids = set(vector_store.get(include=["metadatas"]).get("ids", []))
+        desired_ids: set[str] = set()
         documents: list[Document] = []
         document_ids: list[str] = []
-        indexed_count = 0
+        embedded_count = 0
         for document, document_id in iter_documents(rows):
+            desired_ids.add(document_id)
+            if document_id in existing_ids:
+                continue
             documents.append(document)
             document_ids.append(document_id)
             if len(documents) >= batch_size:
                 vector_store.add_documents(documents, ids=document_ids)
-                indexed_count += len(documents)
-                print(f"[embed] Indexed {indexed_count} embedding windows...")
+                embedded_count += len(documents)
+                print(f"[embed] Added {embedded_count} new embedding windows...")
                 documents.clear()
                 document_ids.clear()
 
         if documents:
             vector_store.add_documents(documents, ids=document_ids)
-            indexed_count += len(documents)
-            print(f"[embed] Indexed {indexed_count} embedding windows...")
+            embedded_count += len(documents)
+            print(f"[embed] Added {embedded_count} new embedding windows...")
+
+        stale_ids = existing_ids - desired_ids
+        stale_id_list = list(stale_ids)
+        for start in range(0, len(stale_id_list), batch_size):
+            stale_batch = stale_id_list[start : start + batch_size]
+            vector_store.delete(ids=stale_batch)
+        if stale_ids:
+            print(f"[remove] Deleted {len(stale_ids)} obsolete embedding windows.")
 
         stored_count = vector_store._collection.count()
-        if stored_count != indexed_count:
+        if stored_count != len(desired_ids):
             raise IndexBuildError(
-                f"Chroma contains {stored_count} documents; expected {indexed_count}."
+                f"Chroma contains {stored_count} documents; expected {len(desired_ids)}."
             )
     except IndexBuildError:
         raise
@@ -214,9 +221,10 @@ def build_index(
         raise IndexBuildError(f"Chroma ingestion failed: {exc}") from exc
 
     print(f"[done] Pages indexed: {len(rows)}")
-    print(f"[done] Searchable embedding windows: {indexed_count}")
+    print(f"[done] Searchable embedding windows: {len(desired_ids)}")
+    print(f"[done] Newly embedded windows: {embedded_count}")
     print(f"[done] Persistent Chroma collection: {chroma_path}")
-    return len(rows), indexed_count
+    return len(rows), len(desired_ids)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -238,8 +246,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
-        help="Documents embedded per CPU batch (default: 32)",
+        default=128,
+        help="Documents embedded per CPU batch (default: 128)",
     )
     return parser.parse_args(argv)
 

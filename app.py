@@ -59,6 +59,7 @@ GEMINI_RETRY_MAX_ATTEMPTS = 5
 RETRIEVAL_CANDIDATE_COUNT = 24
 RETRIEVAL_RESULT_COUNT = 14
 MAX_SEMANTIC_PASSAGES_PER_URL = 2
+MAX_DIRECT_CONTEXT_RECORDS = 4
 STUDENT_ORG_INTENT = re.compile(
     r"\b(clubs?|student[-\s]+(?:clubs?|groups?|organizations?|societies|associations?)|"
     r"associations?|societies|extracurricular|extra-curricular|campus\s+activities)\b",
@@ -427,24 +428,17 @@ def retrieve_context(
     vector_store: Chroma,
     database_records: dict[str, tuple[str, str]],
 ) -> tuple[list[tuple[str, str, str, float]], list[str]]:
-    """Combine semantic matches with the database's direct intent pages."""
+    """Rank by vector meaning first, then add a few verified intent records."""
     query = " ".join(question.split())
     if not query:
         return [], []
 
-    embedding_query = query
-    if re.search(
-        r"\b(data\s+)?analyt(?:ics|ical)\b|\bdata\s+analysis\b",
-        query,
-        re.IGNORECASE,
-    ):
-        embedding_query += " data science big data analysis machine learning"
     semantic_matches = vector_store.similarity_search_with_score(
-        embedding_query,
+        query,
         k=RETRIEVAL_CANDIDATE_COUNT,
     )
 
-    ordered_records: list[tuple[str, str, str, float]] = []
+    direct_records: list[tuple[str, str, str, float]] = []
     seen_direct_urls: set[str] = set()
 
     def add_database_record(url: str, distance: float = 0.0) -> None:
@@ -460,7 +454,7 @@ def retrieve_context(
             f" | Source: {url}"
             f" | Content: {body}"
         )
-        ordered_records.append((chunk, title, url, distance))
+        direct_records.append((chunk, title, url, distance))
         seen_direct_urls.add(url)
 
     # Route intents to their authoritative records when present in SQLite.
@@ -628,6 +622,7 @@ def retrieve_context(
     # Keep the actual matched Chroma windows. Replacing every match with its
     # entire source page and de-duplicating by URL discarded distinct passages
     # from long faculty, programme, and PDF records.
+    semantic_records: list[tuple[str, str, str, float]] = []
     semantic_passages_per_url: dict[str, int] = {}
     seen_semantic_passages: set[tuple[str, str]] = set()
     source_urls: list[str] = []
@@ -649,13 +644,30 @@ def retrieve_context(
             continue
         metadata_title = document.metadata.get("page_title")
         title = metadata_title if isinstance(metadata_title, str) and metadata_title else record[0]
-        ordered_records.append((passage, title, url, float(distance)))
+        semantic_records.append((passage, title, url, float(distance)))
         seen_semantic_passages.add(passage_key)
         semantic_passages_per_url[url] = semantic_passages_per_url.get(url, 0) + 1
-        if len(ordered_records) >= RETRIEVAL_RESULT_COUNT:
+        if len(semantic_records) >= RETRIEVAL_RESULT_COUNT:
             break
 
-    results = ordered_records[:RETRIEVAL_RESULT_COUNT]
+    # Deterministic department/faculty/programme routes are a coverage aid.
+    # They must never displace the passages ranked by embedding similarity.
+    semantic_urls = {url for _chunk, _title, url, _distance in semantic_records}
+    supplemental_records = [
+        record
+        for record in direct_records
+        if record[2] not in semantic_urls
+    ][:MAX_DIRECT_CONTEXT_RECORDS]
+    if semantic_records and supplemental_records:
+        semantic_limit = max(
+            1, RETRIEVAL_RESULT_COUNT - len(supplemental_records)
+        )
+        results = (
+            semantic_records[:semantic_limit]
+            + supplemental_records[: RETRIEVAL_RESULT_COUNT - semantic_limit]
+        )
+    else:
+        results = (semantic_records or direct_records)[:RETRIEVAL_RESULT_COUNT]
     for _chunk, _title, url, _distance in results:
         if url not in source_urls:
             source_urls.append(url)
@@ -870,6 +882,13 @@ synonyms, and follow-up questions. Use semantic relationships in the retrieved
 records; do not require an exact keyword match, and do not claim a connection
 just because two records share a word. Relate topics to departments,
 programmes, courses, and faculty only when the evidence supports that meaning.
+Before drafting, identify what the user is asking for (for example, a person,
+role, department, programme, relationship, or list) and which evidence would
+answer that request. Treat vector similarity as a way to find candidate meaning,
+not as proof that a passage answers the question. Compare the requested
+relationship with the facts in each record, and synthesize relevant records even
+when they use different wording. Do not expose hidden reasoning; return only the
+requested answer and interpretation fields.
 For a question that names a person, search the retrieved faculty and department
 head records for that name. An exact person-name match in an official PSG Tech
 record makes the question in-scope: identify the person and report the listed
