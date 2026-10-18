@@ -46,7 +46,7 @@ import streamlit as st
 from google import genai
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from gemini_retry import generate_gemini_stream_with_retry
+from gemini_retry import generate_gemini_stream_with_retry, http_status_code
 
 
 DATABASE_PATH = BASE_DIR / "psgtech_knowledge_base.db"
@@ -176,19 +176,49 @@ def load_resources() -> tuple[
     return embeddings, vector_store, database_records
 
 
-def gemini_api_key() -> str:
-    """Read a Gemini key from local env or the cloud-managed Streamlit secrets."""
-    environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if environment_key:
-        return environment_key
+def _normalize_api_keys(value: object) -> tuple[str, ...]:
+    """Parse a TOML array or comma/newline-separated key string safely."""
+    if isinstance(value, str):
+        raw_keys = re.split(r"[,;\r\n]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw_keys = list(value)
+    else:
+        raw_keys = []
 
-    # Streamlit Community Cloud stores secrets outside the repository and
-    # exposes them through st.secrets. A local run without secrets.toml is fine.
+    unique_keys: list[str] = []
+    for raw_key in raw_keys:
+        if not isinstance(raw_key, str):
+            continue
+        key = raw_key.strip().strip("\"'")
+        if key and key not in unique_keys:
+            unique_keys.append(key)
+    return tuple(unique_keys)
+
+
+def gemini_api_keys() -> tuple[str, ...]:
+    """Read a server-side key pool, retaining support for the singular setting."""
+    environment_pool = _normalize_api_keys(os.environ.get("GEMINI_API_KEYS", ""))
+    if environment_pool:
+        return environment_pool
+
+    # Streamlit Community Cloud secrets are separate from process environment.
+    # A local run without secrets.toml is expected and falls through cleanly.
     try:
-        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        secrets_pool = _normalize_api_keys(st.secrets.get("GEMINI_API_KEYS", []))
     except Exception:
-        secret_key = ""
-    return str(secret_key).strip()
+        secrets_pool = ()
+    if secrets_pool:
+        return secrets_pool
+
+    single_environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if single_environment_key:
+        return (single_environment_key,)
+
+    try:
+        single_secret_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
+        single_secret_key = ""
+    return (single_secret_key,) if single_secret_key else ()
 
 
 def local_placeholder_proxy() -> str:
@@ -210,8 +240,7 @@ def local_placeholder_proxy() -> str:
 def format_gemini_error(exc: Exception) -> str:
     """Explain Gemini errors without disclosing API keys or proxy credentials."""
     detail = f"{type(exc).__name__}: {exc}"
-    secret = gemini_api_key()
-    if secret:
+    for secret in gemini_api_keys():
         detail = detail.replace(secret, "[redacted]")
     for proxy_name in PROXY_ENV_NAMES:
         proxy_value = os.environ.get(proxy_name, "").strip()
@@ -229,8 +258,9 @@ def format_gemini_error(exc: Exception) -> str:
     lowered = detail.casefold()
     if "401" in lowered or "unauthorized" in lowered:
         return (
-            "Gemini rejected the credential. Confirm GEMINI_API_KEY is a valid "
-            "Google AI Studio Gemini API key and is loaded in this Streamlit process. "
+            "Gemini rejected the credential. Confirm GEMINI_API_KEY or "
+            "GEMINI_API_KEYS contains a valid Google AI Studio Gemini API key and "
+            "is loaded in this Streamlit process. "
             f"Details: {detail}"
         )
     if "403" in lowered or "permission_denied" in lowered:
@@ -912,13 +942,14 @@ def generate_answer(
     resolved_question: str | None = None,
     on_partial: Callable[[str], None] | None = None,
     on_retry: Callable[[int, float], None] | None = None,
+    on_key_fallback: Callable[[int, int, int], None] | None = None,
 ) -> tuple[str, str, str, str]:
     """Stream a grounded structured answer from Gemini."""
-    api_key = gemini_api_key()
-    if not api_key:
+    api_keys = gemini_api_keys()
+    if not api_keys:
         raise RuntimeError(
-            "GEMINI_API_KEY is missing. Add your Google AI Studio key to the project "
-            ".env file or server environment, then restart Streamlit."
+            "No Gemini API key is configured. Set GEMINI_API_KEY or GEMINI_API_KEYS "
+            "in the project .env, server environment, or Streamlit secrets."
         )
 
     history_lines: list[str] = []
@@ -965,10 +996,6 @@ def generate_answer(
                 on_partial(partial_answer)
 
     try:
-        client = genai.Client(
-            api_key=api_key,
-            http_options=genai.types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-        )
         generation_config = genai.types.GenerateContentConfig(
             system_instruction=f"{ADVISOR_INSTRUCTIONS}\n\n{json_instruction}",
             temperature=0.2,
@@ -978,19 +1005,45 @@ def generate_answer(
             response_mime_type="application/json",
         )
 
-        def make_gemini_stream():
-            return client.models.generate_content_stream(
-                model=GEMINI_MODEL,
-                contents=request_content,
-                config=generation_config,
-            )
+        response_text = ""
+        for key_number, api_key in enumerate(api_keys, start=1):
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=genai.types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+                )
 
-        response_text = generate_gemini_stream_with_retry(
-            make_gemini_stream,
-            on_partial=report_streamed_json,
-            on_retry=on_retry,
-            max_attempts=GEMINI_RETRY_MAX_ATTEMPTS,
-        )
+                def make_gemini_stream():
+                    return client.models.generate_content_stream(
+                        model=GEMINI_MODEL,
+                        contents=request_content,
+                        config=generation_config,
+                    )
+
+                response_text = generate_gemini_stream_with_retry(
+                    make_gemini_stream,
+                    on_partial=report_streamed_json,
+                    on_retry=on_retry,
+                    max_attempts=GEMINI_RETRY_MAX_ATTEMPTS,
+                )
+                break
+            except Exception as exc:
+                status_code = http_status_code(exc)
+                can_try_next_key = (
+                    status_code in {401, 403} and key_number < len(api_keys)
+                )
+                if not can_try_next_key:
+                    raise
+
+                # Remove any partial output from the rejected key before
+                # rendering the next configured credential attempt.
+                report_streamed_json("")
+                print(
+                    f"[Gemini key fallback] Key {key_number} returned HTTP "
+                    f"{status_code}; trying configured key {key_number + 1}."
+                )
+                if on_key_fallback is not None:
+                    on_key_fallback(key_number, key_number + 1, status_code)
     except Exception as exc:
         raise RuntimeError(format_gemini_error(exc)) from exc
 
@@ -1316,12 +1369,12 @@ st.sidebar.markdown("### PSG Tech Advisor")
 st.sidebar.caption("Grounded answers from the indexed public website")
 st.sidebar.header("PSG Tech grounded assistant")
 st.sidebar.caption(f"{GEMINI_MODEL} | Google Gemini API")
-if gemini_api_key():
-    st.sidebar.success("Gemini API key loaded; the value is hidden.")
+if gemini_api_keys():
+    st.sidebar.success("Gemini server-side key(s) loaded; values are hidden.")
 else:
     st.sidebar.warning(
-        "GEMINI_API_KEY is not configured. Add it to the project .env "
-        "or server environment to generate model answers."
+        "GEMINI_API_KEY or GEMINI_API_KEYS is not configured. Add it to the "
+        "project .env, server environment, or Streamlit secrets to generate answers."
     )
 if CLEARED_PLACEHOLDER_PROXY_NAMES:
     st.sidebar.info(
@@ -1459,6 +1512,19 @@ if question:
                     state="running",
                 )
 
+            def show_gemini_key_fallback(
+                failed_key_number: int,
+                next_key_number: int,
+                status_code: int,
+            ) -> None:
+                progress_status.update(
+                    label=(
+                        f"Gemini key {failed_key_number} returned HTTP {status_code}; "
+                        f"trying configured key {next_key_number}..."
+                    ),
+                    state="running",
+                )
+
             try:
                 with st.spinner(f"Generating a grounded answer with {GEMINI_MODEL}..."):
                     answer, category, selected_source_url, interpretation = generate_answer(
@@ -1468,6 +1534,7 @@ if question:
                         resolved_question=search_question,
                         on_partial=stream_answer,
                         on_retry=show_gemini_retry,
+                        on_key_fallback=show_gemini_key_fallback,
                     )
                 answer_provider = "Gemini"
             except Exception as llm_exc:

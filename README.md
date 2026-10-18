@@ -6,8 +6,9 @@ the site's robots policy, fetches approved HTML and optionally PDFs, and stores
 cleaned text and source URLs in SQLite. An indexing step creates a persistent
 local Chroma semantic-search index. The Streamlit app retrieves relevant
 database passages and asks Google's Gemini Developer API to format a grounded
-answer. The app reads `GEMINI_API_KEY` from the server environment or the
-project `.env` file; it does not ask visitors to enter a key.
+answer. The app reads Gemini key(s) from server environment variables,
+Streamlit-managed secrets, or the project `.env` file; it does not ask visitors
+to enter a key.
 
 ## Project files
 
@@ -268,16 +269,18 @@ for SQLite can also open the .db file directly.
 ## Run the Gemini RAG assistant
 
 The chat model uses Google's Gemini Developer API with `gemini-3.8-flash`.
-Add your Google AI Studio API key to the project-root `.env` without sharing it:
+Add one or more Google AI Studio API keys to the project-root `.env` without
+sharing them:
 
 ~~~
-GEMINI_API_KEY=your_google_ai_studio_api_key
+GEMINI_API_KEYS=primary_key,backup_key
 ~~~
 
-`app.py` loads this file with `override=True`. If `GEMINI_API_KEY` is set both
-in the shell and in `.env`, the project `.env` value takes precedence. Restart
-Streamlit after changing either credential source. Never commit or share the
-real key.
+`GEMINI_API_KEYS` is a comma-separated list. A single `GEMINI_API_KEY` is still
+accepted for backward compatibility. `app.py` loads `.env` with `override=True`,
+so the project `.env` value takes precedence over a shell variable of the same
+name. Restart Streamlit after changing the credentials. Never commit or share
+real keys.
 
 Install the project dependencies in PowerShell:
 
@@ -348,7 +351,7 @@ use Git LFS.
    it into chat or commit it to GitHub.
 
    ~~~toml
-   GEMINI_API_KEY = "your_google_ai_studio_api_key"
+   GEMINI_API_KEYS = ["primary_key", "backup_key"]
    ~~~
 
 4. Deploy and watch the build and app logs in Streamlit Community Cloud. The
@@ -358,7 +361,13 @@ use Git LFS.
 
 The current project `.env` is for local development only. Cloud secrets are
 read from Streamlit's managed secrets store, and the key is never rendered in
-the UI. See Streamlit's official
+the UI. When a request receives a key-specific `401` or `403`, the app tries
+the next configured key and reports only the key slot and status code. `429`
+quota and `503` service errors do not rotate keys: Google applies Gemini rate
+limits per project, so creating extra keys in the same project does not add
+quota and rotating projects to evade a limit is not an appropriate fallback.
+Use backup credentials only for separately authorized projects with Gemini
+access. See Streamlit's official
 [deployment guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy),
 [secrets guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management),
 and [file organization and Git LFS guidance](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/file-organization).
@@ -373,10 +382,11 @@ which stage failed.
 | Observed error or symptom | What it means | What to check |
 | --- | --- | --- |
 | `DH_KEY_TOO_SMALL` while fetching `robots.txt` | The origin's legacy TLS Diffie-Hellman parameters conflict with the crawler's default TLS policy. The crawler must verify robots before fetching pages. | The crawler currently uses a session-scoped TLS compatibility adapter at OpenSSL security level 1, with certificate and hostname verification still enabled and TLS 1.2 or newer required. If the handshake or certificate check still fails, the crawl stops. Ask the PSG Tech site administrator to modernize TLS; do not disable verification or skip robots. |
-| Gemini `401 UNAUTHENTICATED`, `API key not valid`, or `ACCESS_TOKEN_TYPE_UNSUPPORTED` | The configured credential is rejected or is not a Google AI Studio Developer API key suitable for the Gemini Developer API. This is separate from database retrieval. | Check that `GEMINI_API_KEY` is set to a valid key from an enabled Google AI Studio project and restart Streamlit. Do not paste the key into chat, README, source control, or screenshots. |
+| Gemini `401 UNAUTHENTICATED`, `API key not valid`, or `ACCESS_TOKEN_TYPE_UNSUPPORTED` | The configured credential is rejected or is not a Google AI Studio Developer API key suitable for the Gemini Developer API. This is separate from database retrieval. | Check that `GEMINI_API_KEY` or `GEMINI_API_KEYS` contains a valid key from an enabled Google AI Studio project and restart Streamlit. Do not paste the key into chat, README, source control, or screenshots. |
 | Gemini `403 PERMISSION_DENIED` / project access denied | Google rejected access for the key's project. Changing application code or retrying the same request does not grant project access. | Check the key's project/API status in Google AI Studio/Cloud or contact Google support. Use a key from a project that has Gemini API access. |
 | Gemini `404 NOT_FOUND` for a model | The requested model name is unavailable to that API project/account, or the configured model name is invalid. | Check the available model identifier for the key's API. The app defaults to `gemini-3.8-flash`; configure `GEMINI_MODEL` to an identifier supported by the account, then restart Streamlit. |
 | Gemini `503 UNAVAILABLE` / high demand | Gemini is temporarily unable to serve the request. | The app retries 503 responses at most five times with bounded exponential backoff and jitter. If all attempts fail, it shows the closest retrieved database passage and labels it as a database excerpt, not a generated answer. |
+| Gemini key returns `401` or `403` | That credential is invalid or its project lacks access. | Configure `GEMINI_API_KEYS` as a comma-separated local environment value or a TOML list in Streamlit secrets. The app tries the next key for these key-specific errors. Multiple keys in one Google project share that project's quota; do not use key rotation to evade quota limits. |
 | `Gemini returned an invalid structured response` or no response text | The request reached the answer-validation stage, but Gemini returned empty or malformed JSON that did not meet the app's required fields. This is not necessarily an API-key or retrieval failure. | Retry the query. If it persists, inspect the Streamlit error details and the model response format/configuration. The app falls back to retrieved text when available. |
 | App stays on “Loading the cached PSG Tech Chroma index and CPU embedding model...” | The app is initializing its local embedding model/index, before it can search or call Gemini. | Build the index once with internet access using `python .\rag_engine.py`; check that `psgtech_chroma_db` and the locally cached embedding model exist, then restart the app. The app startup loads the model locally. |
 | Clubs, staff, programmes, or other answers are incomplete | Retrieval can only return records that are present and useful in SQLite/Chroma. Search relevance and context limits can also omit a passage. | Inspect the matching SQLite rows. If needed, crawl permitted PSG Tech pages or ingest an official PDF, then rebuild Chroma with `python .\rag_engine.py`. Do not infer missing facts from a partial excerpt. |
